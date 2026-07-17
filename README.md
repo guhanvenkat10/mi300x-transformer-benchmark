@@ -39,13 +39,40 @@ those small presets.
 
 ## What to look at
 
-Two lines in the output:
+First, the backend line near the top:
+
+- `sdpa avail : flash=... efficient=... math=...` shows which attention kernels this build actually
+  has. On ROCm the auto-dispatcher often silently skips the fast ones, so the script probes them
+  directly and then **forces** the best available.
+- `attention : forcing '...'` says which one is running. `flash` or `efficient` is good (fused, no
+  seq x seq matrix). `math` means both fused kernels are missing from the build and attention is
+  materialized, which is memory-bound and under-reports the GPU.
+
+Then the results:
 
 - `time for N steps` and `ms/step`
 - `throughput ... tokens/sec`
+- peak GPU memory, and a line confirming whether the fused kernel engaged.
 
 The script then prints an extrapolation table converting tokens/sec into hours-per-epoch on 1 GPU and
 on 8 GPUs, for a range of possible corpus sizes.
+
+### Attention backend
+
+```
+--attn auto        # default: force the best available (flash > efficient > math)
+--attn flash       # force flash; errors if not built
+--attn efficient   # force memory-efficient
+--attn math        # force materialized (slow; for comparison only)
+```
+
+To see the difference directly, run the same config with `--attn flash` (or `efficient`) vs
+`--attn math` and compare memory and throughput.
+
+If the probe reports `flash=NO efficient=NO`, this PyTorch build has no fused attention kernel and is
+materializing the score matrix. On ROCm/MI300X the fix is a flash-attention build for AMD (aotriton,
+which recent ROCm PyTorch wheels ship, or a Composable-Kernel flash-attn install). That single change
+is usually a large throughput and memory win, so it is worth sorting before the real runs.
 
 ## What it actually does
 
@@ -62,11 +89,12 @@ sanity check that the training loop is wired up correctly.
 ## Options
 
 ```
---preset      tiny | small | medium | large   (default: large)
---seq-len     tokens per sample               (default: 1024)
---batch-size  samples per step                (default: 16)
---steps       timed steps                     (default: 200)
---warmup      untimed warmup steps            (default: 10)
---dtype       bf16 | fp16 | fp32              (default: bf16)
+--preset      tiny | small | medium | large       (default: large)
+--seq-len     tokens per sample                   (default: 1024)
+--batch-size  samples per step                    (default: 16)
+--steps       timed steps                         (default: 200)
+--warmup      untimed warmup steps                (default: 10)
+--dtype       bf16 | fp16 | fp32                  (default: bf16)
+--attn        auto | flash | efficient | math     (default: auto)
 --list-presets
 ```

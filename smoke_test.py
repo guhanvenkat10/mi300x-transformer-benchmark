@@ -29,6 +29,35 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
+
+# SDPA backends, best -> worst. FLASH and EFFICIENT never materialize the seq x seq matrix.
+BACKENDS = {
+    "flash":     SDPBackend.FLASH_ATTENTION,
+    "efficient": SDPBackend.EFFICIENT_ATTENTION,
+    "math":      SDPBackend.MATH,
+}
+
+
+def probe_backends(device):
+    """Directly test which SDPA backends actually RUN on this stack, rather than guessing from
+    memory. On ROCm the auto-dispatcher often silently skips flash, so we check each explicitly."""
+    if device != "cuda":
+        return {}
+    import warnings
+    q = torch.randn(1, 4, 512, 64, device=device, dtype=torch.bfloat16)
+    avail = {}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for name, backend in BACKENDS.items():
+            try:
+                with sdpa_kernel([backend]):
+                    F.scaled_dot_product_attention(q, q, q, is_causal=True)
+                torch.cuda.synchronize()
+                avail[name] = True
+            except Exception:
+                avail[name] = False
+    return avail
 
 # (d_model, n_layers, n_heads) chosen to land near the four model sizes in the real sweep.
 # Actual parameter count is printed at runtime (don't trust the label, trust the number).
@@ -41,46 +70,37 @@ PRESETS = {
 
 
 class Attention(nn.Module):
-    """Attention via scaled_dot_product_attention with is_causal=True.
+    """Attention via scaled_dot_product_attention, with the backend FORCED via sdpa_kernel().
 
-    IMPORTANT: we pass is_causal=True rather than an explicit attn_mask. Passing an explicit mask
-    forces PyTorch onto the 'math' fallback, which MATERIALIZES the full (batch, heads, seq, seq)
-    score matrix -- O(seq^2) memory per layer, and memory-bandwidth-bound rather than compute-bound.
-    is_causal lets SDPA dispatch to the fused FlashAttention kernel, which never materializes it.
-
-    v1 of this benchmark got this wrong and badly under-reported MI300X throughput as a result.
+    Why forced: on ROCm, SDPA's auto-dispatcher frequently skips the fused flash/efficient kernel
+    and silently falls back to materializing the full (batch, heads, seq, seq) score matrix --
+    O(seq^2) memory per layer, memory-bandwidth-bound instead of compute-bound. Forcing the backend
+    guarantees the fused path runs (or errors loudly if it genuinely isn't built).
     """
-    def __init__(self, d_model, n_heads, use_sdpa=True):
+    def __init__(self, d_model, n_heads, backend):
         super().__init__()
         assert d_model % n_heads == 0
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.proj = nn.Linear(d_model, d_model, bias=False)
-        self.use_sdpa = use_sdpa
+        self.backend = backend  # an SDPBackend enum
 
     def forward(self, x):
         B, T, C = x.shape
         qkv = self.qkv(x).reshape(B, T, 3, self.n_heads, self.d_head).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        if self.use_sdpa:
-            # fused path: no seq x seq matrix ever exists
+        with sdpa_kernel([self.backend]):
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        else:
-            # legacy 'math' path, kept only so the difference can be demonstrated
-            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)
-            mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
-            att = att.masked_fill(mask, float("-inf")).softmax(dim=-1)
-            out = att @ v
         out = out.transpose(1, 2).reshape(B, T, C)
         return self.proj(out)
 
 
 class Block(nn.Module):
-    def __init__(self, d_model, n_heads, use_sdpa=True):
+    def __init__(self, d_model, n_heads, backend):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
-        self.attn = Attention(d_model, n_heads, use_sdpa)
+        self.attn = Attention(d_model, n_heads, backend)
         self.ln2 = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
@@ -97,11 +117,11 @@ class Block(nn.Module):
 class Transformer(nn.Module):
     """Plain decoder-style transformer. Stand-in for the real masked-denoising model;
     per-token FLOPs are the same, which is all that matters for timing."""
-    def __init__(self, vocab, seq_len, d_model, n_layers, n_heads, use_sdpa=True):
+    def __init__(self, vocab, seq_len, d_model, n_layers, n_heads, backend):
         super().__init__()
         self.tok = nn.Embedding(vocab, d_model)
         self.pos = nn.Embedding(seq_len, d_model)
-        self.blocks = nn.ModuleList([Block(d_model, n_heads, use_sdpa) for _ in range(n_layers)])
+        self.blocks = nn.ModuleList([Block(d_model, n_heads, backend) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab, bias=False)
         self.seq_len = seq_len
@@ -132,8 +152,8 @@ def main():
     p.add_argument("--steps", type=int, default=200, help="timed steps (one 'epoch' for this test)")
     p.add_argument("--warmup", type=int, default=10, help="untimed warmup steps")
     p.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
-    p.add_argument("--attn", default="sdpa", choices=["sdpa", "math"],
-                   help="sdpa = fused flash kernel (correct). math = legacy materialized attention.")
+    p.add_argument("--attn", default="auto", choices=["auto", "flash", "efficient", "math"],
+                   help="which SDPA backend to FORCE. auto = best available (flash>efficient>math).")
     p.add_argument("--list-presets", action="store_true")
     args = p.parse_args()
 
@@ -152,18 +172,31 @@ def main():
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
     cfg = PRESETS[args.preset]
 
+    # Probe which SDPA backends actually run on this stack, then pick the one to force.
+    avail = probe_backends(device)
+    if args.attn == "auto":
+        chosen = next((n for n in ["flash", "efficient", "math"] if avail.get(n)), "math")
+    else:
+        chosen = args.attn
+        if device == "cuda" and not avail.get(chosen, False):
+            print(f"  !! requested backend '{chosen}' is NOT available on this stack; it may error.")
+
     print("=" * 68)
     print("  RIBO-SEQ FM SMOKE TEST + THROUGHPUT BENCHMARK")
     print("=" * 68)
     print(f"  device      : {dev_name}")
     print(f"  torch       : {torch.__version__}")
+    if device == "cuda":
+        avail_str = " ".join(f"{n}={'yes' if ok else 'NO'}" for n, ok in avail.items())
+        print(f"  sdpa avail  : {avail_str}")
+    print(f"  attention   : forcing '{chosen}'" +
+          ("  <-- fused, no seq^2 matrix" if chosen in ("flash", "efficient")
+           else "  <-- MATERIALIZED, memory-bound (flash unavailable on this build!)"))
     print(f"  preset      : {args.preset}  {cfg}")
     print(f"  seq_len     : {args.seq_len}   batch: {args.batch_size}   dtype: {args.dtype}")
-    print(f"  attention   : {args.attn}" + ("  (fused flash kernel)" if args.attn == "sdpa"
-                                            else "  (LEGACY materialized -- slow, for comparison only)"))
     print("=" * 68)
 
-    model = Transformer(args.vocab, args.seq_len, use_sdpa=(args.attn == "sdpa"), **cfg).to(device)
+    model = Transformer(args.vocab, args.seq_len, backend=BACKENDS[chosen], **cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  parameters  : {human(n_params)}  ({n_params:,})")
 
@@ -211,22 +244,17 @@ def main():
     if device == "cuda":
         print(f"  peak GPU memory     : {peak_gb:.1f} GB")
 
-        # Diagnostic: if the seq x seq score matrix were materialized, it alone would need this much.
-        # If peak memory is well BELOW it, the fused kernel engaged and we're compute-bound (good).
+        # We FORCED a backend, so the story is definite -- no need to infer from memory.
         materialized_gb = (args.batch_size * cfg["n_heads"] * args.seq_len * args.seq_len
                            * 2 * cfg["n_layers"]) / 1e9
-        print(f"  attn matrices would need {materialized_gb:.1f} GB if materialized")
-        if args.attn == "math":
-            print("  >> math path, as requested. Expected to be slow + memory heavy. Not a real number.")
-        elif materialized_gb < 10.0:
-            # below this, model states + activations swamp the attention matrices and the
-            # comparison is not diagnostic. Need a big batch for a clean signal.
-            print("  >> (batch too small to auto-detect kernel; use --batch-size 64+ to check)")
-        elif peak_gb > 0.6 * materialized_gb:
-            print("  >> WARNING: memory ~= materialized size. Fused kernel did NOT engage.")
-            print("  >> Throughput is memory-bound and UNDER-REPORTS this GPU.")
+        if chosen in ("flash", "efficient"):
+            print(f"  >> OK: forced '{chosen}' -- fused kernel, no seq^2 matrix. This is the real number.")
+            print(f"     (materializing would have needed {materialized_gb:.1f} GB just for scores.)")
         else:
-            print("  >> OK: fused attention engaged (memory well below materialized size).")
+            print(f"  >> forced 'math' -- MATERIALIZED ({materialized_gb:.1f} GB of scores). Memory-bound.")
+            if not avail.get("flash") and not avail.get("efficient"):
+                print("  >> flash + efficient are BOTH unavailable on this torch build.")
+                print("  >> Fix: install a ROCm flash-attention (aotriton/CK) build. See README.")
     print("-" * 68)
 
     # ---- extrapolation: how long is one epoch of the REAL corpus, for THIS model size ----
