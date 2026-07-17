@@ -40,11 +40,47 @@ PRESETS = {
 }
 
 
+class Attention(nn.Module):
+    """Attention via scaled_dot_product_attention with is_causal=True.
+
+    IMPORTANT: we pass is_causal=True rather than an explicit attn_mask. Passing an explicit mask
+    forces PyTorch onto the 'math' fallback, which MATERIALIZES the full (batch, heads, seq, seq)
+    score matrix -- O(seq^2) memory per layer, and memory-bandwidth-bound rather than compute-bound.
+    is_causal lets SDPA dispatch to the fused FlashAttention kernel, which never materializes it.
+
+    v1 of this benchmark got this wrong and badly under-reported MI300X throughput as a result.
+    """
+    def __init__(self, d_model, n_heads, use_sdpa=True):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.proj = nn.Linear(d_model, d_model, bias=False)
+        self.use_sdpa = use_sdpa
+
+    def forward(self, x):
+        B, T, C = x.shape
+        qkv = self.qkv(x).reshape(B, T, 3, self.n_heads, self.d_head).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        if self.use_sdpa:
+            # fused path: no seq x seq matrix ever exists
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            # legacy 'math' path, kept only so the difference can be demonstrated
+            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)
+            mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
+            att = att.masked_fill(mask, float("-inf")).softmax(dim=-1)
+            out = att @ v
+        out = out.transpose(1, 2).reshape(B, T, C)
+        return self.proj(out)
+
+
 class Block(nn.Module):
-    def __init__(self, d_model, n_heads):
+    def __init__(self, d_model, n_heads, use_sdpa=True):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.attn = Attention(d_model, n_heads, use_sdpa)
         self.ln2 = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
@@ -52,10 +88,8 @@ class Block(nn.Module):
             nn.Linear(4 * d_model, d_model),
         )
 
-    def forward(self, x, attn_mask):
-        h = self.ln1(x)
-        a, _ = self.attn(h, h, h, attn_mask=attn_mask, need_weights=False)
-        x = x + a
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -63,11 +97,11 @@ class Block(nn.Module):
 class Transformer(nn.Module):
     """Plain decoder-style transformer. Stand-in for the real masked-denoising model;
     per-token FLOPs are the same, which is all that matters for timing."""
-    def __init__(self, vocab, seq_len, d_model, n_layers, n_heads):
+    def __init__(self, vocab, seq_len, d_model, n_layers, n_heads, use_sdpa=True):
         super().__init__()
         self.tok = nn.Embedding(vocab, d_model)
         self.pos = nn.Embedding(seq_len, d_model)
-        self.blocks = nn.ModuleList([Block(d_model, n_heads) for _ in range(n_layers)])
+        self.blocks = nn.ModuleList([Block(d_model, n_heads, use_sdpa) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab, bias=False)
         self.seq_len = seq_len
@@ -76,9 +110,8 @@ class Transformer(nn.Module):
         B, T = idx.shape
         pos = torch.arange(T, device=idx.device)
         x = self.tok(idx) + self.pos(pos)[None, :, :]
-        mask = torch.triu(torch.ones(T, T, device=idx.device, dtype=torch.bool), diagonal=1)
         for blk in self.blocks:
-            x = blk(x, mask)
+            x = blk(x)
         return self.head(self.ln_f(x))
 
 
@@ -99,6 +132,8 @@ def main():
     p.add_argument("--steps", type=int, default=200, help="timed steps (one 'epoch' for this test)")
     p.add_argument("--warmup", type=int, default=10, help="untimed warmup steps")
     p.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
+    p.add_argument("--attn", default="sdpa", choices=["sdpa", "math"],
+                   help="sdpa = fused flash kernel (correct). math = legacy materialized attention.")
     p.add_argument("--list-presets", action="store_true")
     args = p.parse_args()
 
@@ -124,9 +159,11 @@ def main():
     print(f"  torch       : {torch.__version__}")
     print(f"  preset      : {args.preset}  {cfg}")
     print(f"  seq_len     : {args.seq_len}   batch: {args.batch_size}   dtype: {args.dtype}")
+    print(f"  attention   : {args.attn}" + ("  (fused flash kernel)" if args.attn == "sdpa"
+                                            else "  (LEGACY materialized -- slow, for comparison only)"))
     print("=" * 68)
 
-    model = Transformer(args.vocab, args.seq_len, **cfg).to(device)
+    model = Transformer(args.vocab, args.seq_len, use_sdpa=(args.attn == "sdpa"), **cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  parameters  : {human(n_params)}  ({n_params:,})")
 
@@ -172,7 +209,24 @@ def main():
     print(f"  throughput          : {human(tok_per_s)} tokens/sec")
     print(f"  final loss          : {last:.3f}  (random data -> ~ln(vocab)={math.log(args.vocab):.2f}, sanity only)")
     if device == "cuda":
-        print(f"  peak GPU memory     : {peak_gb:.1f} GB / ~192 GB per MI300X")
+        print(f"  peak GPU memory     : {peak_gb:.1f} GB")
+
+        # Diagnostic: if the seq x seq score matrix were materialized, it alone would need this much.
+        # If peak memory is well BELOW it, the fused kernel engaged and we're compute-bound (good).
+        materialized_gb = (args.batch_size * cfg["n_heads"] * args.seq_len * args.seq_len
+                           * 2 * cfg["n_layers"]) / 1e9
+        print(f"  attn matrices would need {materialized_gb:.1f} GB if materialized")
+        if args.attn == "math":
+            print("  >> math path, as requested. Expected to be slow + memory heavy. Not a real number.")
+        elif materialized_gb < 10.0:
+            # below this, model states + activations swamp the attention matrices and the
+            # comparison is not diagnostic. Need a big batch for a clean signal.
+            print("  >> (batch too small to auto-detect kernel; use --batch-size 64+ to check)")
+        elif peak_gb > 0.6 * materialized_gb:
+            print("  >> WARNING: memory ~= materialized size. Fused kernel did NOT engage.")
+            print("  >> Throughput is memory-bound and UNDER-REPORTS this GPU.")
+        else:
+            print("  >> OK: fused attention engaged (memory well below materialized size).")
     print("-" * 68)
 
     # ---- extrapolation: how long is one epoch of the REAL corpus, for THIS model size ----
